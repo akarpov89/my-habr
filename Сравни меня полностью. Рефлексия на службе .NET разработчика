@@ -1,0 +1,1456 @@
+<img src="https://habrastorage.org/files/028/1fa/7c0/0281fa7c0f364af7bd6fce4cc3b751de.jpg" align="left"/> 
+
+Недавно передо мной встала следующая задача: необходимо сравнить множество пар объектов. Но есть один нюанс: объекты - самые что ни на есть <code>object</code>'ы, а сравнивать нужно по всему набору публичных свойств. Причём совершенно необязательно, что типы сравниваемых объектов реализуют интерфейс <a href="https://msdn.microsoft.com/en-us/library/ms131187(v=vs.110).aspx"><code>IEquatable&lt;T&gt;</code></a>. 
+
+Было очевидно, что следует использовать рефлексию. Однако при реализации я столкнулся со множеством тонкостей и в конечном счёте прибегнул к <s>чёрной магии</s> динамической генерации IL. В этой статье я хотел бы поделиться опытом и рассказать о том, как я решал эту задачу. Если Вас заинтересовала тема, то прошу под кат!
+<cut />
+<h5>Часть 1. Объект в отражении</h5>
+<blockquote>
+"Подать сюда <s>MFC</s> IEqualityComparer!", - кричал он, топая всеми четырьмя лапами
+</blockquote>
+В .NET принято, что классы, выполняющие сравнение объектов, реализуют интерфейс <a href="https://msdn.microsoft.com/en-us/library/ms132151(v=vs.110).aspx">IEqualityComparer&lt;T&gt;</a>. Это позволяет внедрять их в классы коллекций, например, списки и словари, и использовать кастомную проверку равенства при поиске. Мы не будем отступать от этого соглашения и приступим к реализации интерфейса <code>IEqualityComparer&lt;object&gt;</code>, использующей механизм рефлексии. Напомним, что рефлексией называется инспектирование метаданных и скомпилированного кода в процессе выполнения программы (читателю, незнакомому с рефлексией, настоятельно рекомендуется ознакомиться с главой "Рефлексия и метаданные" книги Джозефа и Бена Албахари <a href="http://www.williamspublishing.com/Books/978-5-8459-1819-2.html">"C# 5.0. Справочник. Полное описание языка"</a>). 
+
+<source lang="CSharp">
+public class ReflectionComparer : IEqualityComparer<object>
+{
+    public new bool Equals(object x, object y)
+    {
+        public new bool Equals(object x, object y)
+        {
+            return CompareObjectsInternal(x?.GetType(), x, y);
+        }
+    }
+
+    public int GetHashCode(object obj)
+    {
+        return obj.GetHashCode();
+    }
+    
+    private bool CompareObjectsInternal(Type type, object x, object y)
+    {
+        throw new NotImplementedException();
+    }
+}
+</source>
+Заметим, что метод <code>Equals</code> мы отметили как <code>new</code>. Это сделано потому, что он перекрывает метод <code>Object.Equals(object, object)</code>.
+
+Теперь сделаем шаг назад и точнее определим, что именно мы будем сравнивать. Объекты могут быть сколь угодно сложными, всё нужно учесть. Комбинируя следующие типы свойств мы сможем покрыть широкий класс входных данных:
+
+<ul>
+	<li>все примитивные типы (Boolean, Byte, SByte, Int16, UInt16, Int32, UInt32, Int64, UInt64, IntPtr, UIntPtr, Char, Double, Single);</li>
+        <li>строки;</li>
+        <li>массивы (для простоты будем рассматривать только одномерные массивы);</li>
+        <li>перечисления;</li>
+        <li>коллекции, реализующие интерфейс IEnumerable&lt;T&gt;;</li>
+        <li>структуры;</li>
+        <li>классы.</li>
+</ul>
+Напишем каркас метода <code>CompareObjectsInternal</code>, а затем рассмотрим некоторые частные случаи.
+
+<source lang="CSharp">
+private bool CompareObjectsInternal(Type type, object x, object y)
+{
+    // Если ссылки указывают на один и тот же объект
+    if (ReferenceEquals(x, y)) return true;
+
+    // Один из объектов равен null
+    if (ReferenceEquals(x, null) != ReferenceEquals(y, null)) return false;
+
+    // Объекты имеют разные типы
+    if (x.GetType() != y.GetType()) return false;
+
+    // Строки
+    if (Type.GetTypeCode(type) == TypeCode.String)  return ((string)x).Equals((string)y);
+
+    // Массивы
+    if (type.IsArray) return CompareArrays(type, x, y);
+    
+    // Коллекции
+    if (type.IsImplementIEnumerable()) return CompareEnumerables(type, x, y);
+
+    // Ссылочные типы
+    if (type.IsClass || type.IsInterface) return CompareAllProperties(type, x, y);
+
+    // Примитивные типы или типы перечислений 
+    if (type.IsPrimitive || type.IsEnum) return x.Equals(y);
+
+    // Обнуляемые типы
+    if (type.IsNullable()) return CompareNullables(type, x, y);
+
+    // Структуры
+    if (type.IsValueType) return CompareAllProperties(type, x, y);
+
+    return x.Equals(y);
+}
+</source>
+Приведённый выше код достаточно понятен: сначала проверяем объекты на ссылочное равенство и равенство <code>null</code>, затем проверяем типы, а после этого рассматриваем различные случаи. Причём для строк, примитивных типов и типов перечислений мы, не мудрствуя лукаво, вызываем метод <code>Equals</code>. Для проверки типов на принадлежность к обнуляемым типам и типам коллекций мы используем методы расширения <code>IsNullable</code> и <code>IsImplementIEnumerable</code>, исходный код которых можно посмотреть ниже.
+
+<spoiler title="Код методов расширения">
+<source lang="CSharp">
+public static bool IsImplementIEnumerable(this Type type)  => type.GetInterface("IEnumerable`1") != null;
+public static Type GetIEnumerableInterface(this Type type) => type.GetInterface("IEnumerable`1");
+public static bool IsNullable(this Type type) => type.IsGenericType && type.GetGenericTypeDefinition() == typeof (Nullable<>);
+</source>
+</spoiler>
+В случае классов, интерфейсов и структур мы сравниваем все соответствующие свойства. Заметим, что индексаторы в .NET также представляют собой свойства, однако мы ограничимся простыми (parameterless) свойствами, имеющими геттеры, а сравнение коллекций будем обрабатывать отдельно. Проверить, является ли свойство индексатором мы можем с помощью метода <a href="https://msdn.microsoft.com/en-us/library/system.reflection.propertyinfo.getindexparameters(v=vs.110).aspx">PropertyInfo.GetIndexParameters</a>. Если метод вернул массив ненулевой длины, значит мы имеем дело с индексатором. 
+
+<source lang="CSharp">
+private bool CompareAllProperties(Type type, object x, object y)
+{
+    var properties = type.GetProperties(BindingFlags.Instance | BindingFlags.Public);
+    var readableNonIndexers = properties.Where(p => p.CanRead && p.GetIndexParameters().Length == 0);
+
+    foreach (PropertyInfo propertyInfo in readableNonIndexers)
+    {
+        var a = propertyInfo.GetValue(x, null);
+        var b = propertyInfo.GetValue(y, null);
+
+        if (!CompareObjectsInternal(propertyInfo.PropertyType, a, b)) return false;
+    }
+
+    return true;
+}
+</source>
+Следующий случае - сравнение объектов nullable-типов. Если нижележащий тип примитивный, то мы можем сравнить значения методом <code>Equals</code>. Если же внутри объектов лежат структуры, тогда необходимо сначала извлечь внутренние знаения, а затем сравнить их по всем публичным свойствам. Мы безопасно можем обращаться к свойству <code>Value</code>, поскольку проверка на равенства уже была выполнена ранее в методе <code>CompareObjectsInternal</code>. 
+
+<source lang="CSharp">
+private bool CompareNullables(Type type, object x, object y)
+{
+    Type underlyingTypeOfNullableType = Nullable.GetUnderlyingType(type);
+
+    if (underlyingTypeOfNullableType.IsPrimitive)
+    {
+        return x.Equals(y);
+    }
+
+    var valueProperty = type.GetProperty("Value");
+    var a = valueProperty.GetValue(x, null);
+    var b = valueProperty.GetValue(y, null);
+
+    return CompareAllProperties(underlyingTypeOfNullableType, a, b);
+}
+</source>
+Перейдём к сравнению коллекций. Реализацию можно выполнить как минимум двумя способами: написать свой необобщённый метод, работающий с IEnumerable, либо использовать метод расширения <a href="https://msdn.microsoft.com/en-us/library/vstudio/bb342073(v=vs.100).aspx">Enumerable.SequenceEqual&lt;TSource&gt;</a>. Для коллекций, элементами которых являются тип-значения, очевидно, что необобщённый метод будет работать медленее, т.к. ему постоянно придётся выполнять упаковку/распаковку значений. При использовании же метода LINQ нам нужно сначала подставить тип элементов коллекции в параметр-типа TSource с помощью метода <a href="https://msdn.microsoft.com/en-us/library/system.reflection.methodinfo.makegenericmethod(v=vs.110).aspx">MakeGenericMethod</a>), а затем вызвать метод передав две сравниваемые коллекции. Причём, если коллекция содержит элементы непримитивных типов, то мы можем передать дополнительный аргумент - компарер - текущий экземпляр нашего класса <code>ReflectionComparer</code> (не зря же мы реализовывали интерфейс <code>IEqualityComparer&lt;object&gt;</code>!). Поэтому для сравнения коллекций выбираем LINQ: 
+
+<source lang="CSharp">
+private static MethodInfo GenericSequenceEqualWithoutComparer = typeof(Enumerable)
+        .GetMethods(BindingFlags.Public | BindingFlags.Static)
+        .First(m => m.Name == "SequenceEqual" && m.GetParameters().Length == 2);
+
+private static MethodInfo GenericSequenceEqualWithComparer = typeof(Enumerable)
+        .GetMethods(BindingFlags.Public | BindingFlags.Static)
+        .First(m => m.Name == "SequenceEqual" && m.GetParameters().Length == 3);
+
+private bool CompareEnumerables(Type collectionType, object x, object y)
+{
+    Type enumerableInterface = collectionType.GetIEnumerableInterface();
+    Type elementType = enumerableInterface.GetGenericArguments()[0];
+
+    MethodInfo sequenceEqual;
+    object[] arguments;
+
+    if (elementType.IsPrimitive)
+    {
+        sequenceEqual = GenericSequenceEqualWithoutComparer;
+        arguments = new[] {x, y};
+    }
+    else
+    {
+        sequenceEqual = GenericSequenceEqualWithComparer;
+        arguments = new[] {x, y, this};
+    }
+
+    var sequenceEqualMethod = sequenceEqual.MakeGenericMethod(elementType);
+
+    return (bool)sequenceEqualMethod.Invoke(null, arguments);
+}       
+</source>
+Последний случай - сравнение массивов - во многом похож на сравнение коллекций. Отличие состоит в том, что вместо использования стандартного метода LINQ мы используем самописный обобщённый метод. Реализация сравнения массивов представлена ниже:
+
+<spoiler title="Сравнение массивов">
+<source lang="CSharp">
+private static MethodInfo GenericCompareArraysMethod =
+    typeof(ReflectionComparer).GetMethod("GenericCompareArrays", BindingFlags.NonPublic | BindingFlags.Static);
+            
+private static bool GenericCompareArrays<T>(T[] x, T[] y, IEqualityComparer<T> comparer)
+{
+    var comp = comparer ?? EqualityComparer<T>.Default;
+
+    for (int i = 0; i < x.Length; ++i)
+    {
+        if (!comp.Equals(x[i], y[i])) return false;
+    }
+
+    return true;
+}
+
+private bool CompareArrays(Type type, object x, object y)
+{
+    var elementType = type.GetElementType();
+    int xLength, yLength;
+    
+    if (elementType.IsValueType)
+    {
+        // Массивы типов-значений не приводятся к массиву object, поэтому используем Array
+        xLength = ((Array) x).Length;
+        yLength = ((Array) y).Length;
+    }
+    else
+    {
+        xLength = ((object[]) x).Length;
+        yLength = ((object[]) y).Length;
+    }
+
+    if (xLength != yLength) return false;
+
+    var compareArraysPrimitive = GenericCompareArraysMethod.MakeGenericMethod(elementType);
+    var arguments = elementType.IsPrimitive ? new[] {x, y, null} : new[] {x, y, this};
+
+    return (bool) compareArraysPrimitive.Invoke(null, arguments);
+}
+</source>
+</spoiler>
+Итак, все части пазла собраны - наш рефлексивный компарер готов. Ниже представлены результаты сравнения производительности рефлексивного компарера по сравнению с ручной реализацией на "тестовых" данных. Очевидно, что время выполнения сравнения <b>очень</b> сильно зависит от типа сравниваемых объектов. В качестве примера здесь сравнивались объекты двух типов - условно "посложнее" и "попроще". Для оценки времени выполнения использовалась библиотека <a href="https://github.com/PerfDotNet/BenchmarkDotNet">BenchmarkDotNet</a>, за которую особую благодарность хочется выразить Андрею Акиньшину @DreamWalker.
+ 
+<spoiler title="Код тут">
+<source lang="CSharp">
+public struct Struct
+{
+    private int m_a;
+    private double m_b;
+    private string m_c;
+
+    public int A => m_a;
+    public double B => m_b;
+    public string C => m_c;
+
+    public Struct(int a, double b, string c)
+    {
+        m_a = a;
+        m_b = b;
+        m_c = c;
+    }
+}
+
+public class SimpleClass
+{
+    public int A { get; set; }
+    public Struct B { get; set; }
+}
+
+public class ComplexClass
+{
+    public int A { get; set; }
+    public IntPtr B { get; set; }
+    public UIntPtr C { get; set; }
+    public string D { get; set; }
+    public SimpleClass E { get; set; }
+    public int? F { get; set; }
+    public int[] G { get; set; }
+    public List<int> H { get; set; }
+    public double I { get; set; }
+    public float J { get; set; }
+}
+
+[BenchmarkTask(platform: BenchmarkPlatform.X86, jitVersion: BenchmarkJitVersion.LegacyJit)]
+[BenchmarkTask(platform: BenchmarkPlatform.X64, jitVersion: BenchmarkJitVersion.LegacyJit)]
+[BenchmarkTask(platform: BenchmarkPlatform.X64, jitVersion: BenchmarkJitVersion.RyuJit)]
+public class ComparisonTest
+{
+    private static int[] MakeArray(int count)
+    {
+        var array = new int[count];
+
+        for (int i = 0; i < array.Length; ++i)
+            array[i] = i;
+
+        return array;
+    }
+
+    private static List<int> MakeList(int count)
+    {
+        var list = new List<int>(count);
+
+        for (int i = 0; i < list.Count; ++i)
+            list.Add(i);
+
+        return list;
+    }
+
+    private ComplexClass x = new ComplexClass
+    {
+        A = 2,
+        B = new IntPtr(2),
+        C = new UIntPtr(2),
+        D = "abc",
+        E = new SimpleClass { A = 42, B = new Struct(42, 3.14, "meow") },
+        F = 1,
+        G = MakeArray(100),
+        H = MakeList(100),
+        I = double.MaxValue,
+        J = float.MaxValue
+    };
+
+    private ComplexClass y = new ComplexClass
+    {
+        A = 2,
+        B = new IntPtr(2),
+        C = new UIntPtr(2),
+        D = "abc",
+        E = new SimpleClass { A = 42, B = new Struct(42, 3.14, "meow") },
+        F = 1,
+        G = MakeArray(100),
+        H = MakeList(100),
+        I = double.MaxValue,
+        J = float.MaxValue
+    };
+
+    private ReflectionComparer comparer = new ReflectionComparer();
+
+    [Benchmark]
+    public void ReflectionCompare()
+    {
+        var _ = comparer.Equals(x, y);
+    }
+
+    [Benchmark]
+    public void ManualCompare()
+    {
+        var _ = CompareComplexObjects();
+    }
+
+    private bool CompareComplexObjects()
+    {
+        if (x == y) return true;
+        if (x.A != y.A) return false;
+        if (x.B != y.B) return false;
+        if (x.C != y.C) return false;
+        if (x.D != y.D) return false;
+        if (x.E != y.E)
+        {
+            if (x.E.A != y.E.A) return false;
+            var s1 = x.E.B;
+            var s2 = y.E.B;
+            if (s1.A != s2.A) return false;
+            if (!s1.B.Equals(s2.B)) return false;
+            if (s1.C != s2.C) return false;
+        }
+        if (x.F != y.F) return false;
+        if (x.G != y.G)
+        {
+            if (x.G?.Length != y.G?.Length) return false;
+            int[] a = x.G, b = y.G;
+            for (int i = 0; i < a.Length; ++i)
+            {
+                if (a[i] != b[i]) return false;
+            }
+        }
+        if (x.H != y.H)
+        {
+            if (!x.H.SequenceEqual(y.H)) return false;
+        }
+        if (!x.I.Equals(y.I)) return false;
+        if (!x.J.Equals(y.J)) return false;
+        return true;
+    }
+}
+
+[BenchmarkTask(platform: BenchmarkPlatform.X86, jitVersion: BenchmarkJitVersion.LegacyJit)]
+[BenchmarkTask(platform: BenchmarkPlatform.X64, jitVersion: BenchmarkJitVersion.LegacyJit)]
+[BenchmarkTask(platform: BenchmarkPlatform.X64, jitVersion: BenchmarkJitVersion.RyuJit)]
+public class SimpleComparisonTest
+{
+    private SimpleClass x = new SimpleClass { A = 42, B = new Struct(42, 3.14, "meow") };
+    private SimpleClass y = new SimpleClass { A = 42, B = new Struct(42, 3.14, "meow") };
+
+    private ReflectionComparer comparer = new ReflectionComparer();
+
+    [Benchmark]
+    public void ReflectionCompare()
+    {
+        var _ = comparer.Equals(x, y);
+    }
+
+    [Benchmark]
+    public void ManualCompare()
+    {
+        var _ = CompareSimpleObjects();
+    }
+
+    private bool CompareSimpleObjects()
+    {
+        if (x == y) return true;
+        if (x.A != y.A) return false;
+        var s1 = x.B;
+        var s2 = y.B;
+        if (s1.A != s2.A) return false;
+        if (!s1.B.Equals(s2.B)) return false;
+        if (s1.C != s2.C) return false;
+        return true;
+    }
+}    
+</source>
+</spoiler>
+<spoiler title="Результаты тут">
+BenchmarkDotNet=v0.7.8.0
+OS=Microsoft Windows NT 6.2.9200.0
+Processor=Intel(R) Core(TM) i5-2410M CPU @ 2.30GHz, ProcessorCount=4
+HostCLR=MS.NET 4.0.30319.42000, Arch=64-bit  [RyuJIT]
+
+<b>Результаты сравнения объектов ComplexClass</b> 
+<table>
+<tr>
+  <th>Method</th>
+  <th>Platform</th>
+  <th>Jit</th>
+  <th>AvrTime</th>
+  <th>StdDev</th>
+  <th>op/s</th>
+</tr>
+<tr>
+  <td>ManualCompare</td>
+  <td>X64</td>
+  <td>LegacyJit</td>
+  <td>1,364.3835 ns</td>
+  <td>47.6975 ns</td>
+  <td>732,941.68</td>
+</tr>
+<tr>
+  <td>ReflectionCompare</td>
+  <td>X64</td>
+  <td>LegacyJit</td>
+  <td>36,779.9097 ns</td>
+  <td>3,080.9738 ns</td>
+  <td>27,188.92</td>
+</tr>
+<tr>
+  <td>ManualCompare</td>
+  <td>X64</td>
+  <td>RyuJit</td>
+  <td>930.8761 ns</td>
+  <td>43.6018 ns</td>
+  <td>1,074,294.12</td>
+</tr>
+<tr>
+  <td>ReflectionCompare</td>
+  <td>X64</td>
+  <td>RyuJit</td>
+  <td>36,909.7334 ns</td>
+  <td>3,762.0698 ns</td>
+  <td>27,093.98</td>
+</tr>
+<tr>
+  <td>ManualCompare</td>
+  <td>X86</td>
+  <td>LegacyJit</td>
+  <td>936.3367 ns</td>
+  <td>38.3831 ns</td>
+  <td>1,067,992.54</td>
+</tr>
+<tr>
+  <td>ReflectionCompare</td>
+  <td>X86</td>
+  <td>LegacyJit</td>
+  <td>32,446.6969 ns</td>
+  <td>1,687.8442 ns</td>
+  <td>30,819.81</td>
+</tr>
+</table>
+<b>Результаты сравнения объектов SimpleClass</b>
+<table>
+<tr>
+  <th>Method</th>
+  <th>Platform</th>
+  <th>Jit</th>
+  <th>AvrTime</th>
+  <th>StdDev</th>
+  <th>op/s</th>
+</tr>
+<tr>
+  <td>Handwritten</td>
+  <td>X64</td>
+  <td>LegacyJit</td>
+  <td>131.5205 ns</td>
+  <td>4.9045 ns</td>
+  <td>7,603,376.64</td>
+</tr>
+<tr>
+  <td>ReflectionComparer</td>
+  <td>X64</td>
+  <td>LegacyJit</td>
+  <td>3,859.7102 ns</td>
+  <td>269.8845 ns</td>
+  <td>259,087.15</td>
+</tr>
+<tr>
+  <td>Handwritten</td>
+  <td>X64</td>
+  <td>RyuJit</td>
+  <td>61.2438 ns</td>
+  <td>1.9025 ns</td>
+  <td>16,328,222.24</td>
+</tr>
+<tr>
+  <td>ReflectionComparer</td>
+  <td>X64</td>
+  <td>RyuJit</td>
+  <td>3,841.4645 ns</td>
+  <td>374.0006 ns</td>
+  <td>260,317.46</td>
+</tr>
+<tr>
+  <td>Handwritten</td>
+  <td>X86</td>
+  <td>LegacyJit</td>
+  <td>71.5982 ns</td>
+  <td>5.4304 ns</td>
+  <td>13,966,823.95</td>
+</tr>
+<tr>
+  <td>ReflectionComparer</td>
+  <td>X86</td>
+  <td>LegacyJit</td>
+  <td>3,636.7963 ns</td>
+  <td>241.3940 ns</td>
+  <td>274,967.76</td>
+</tr>
+</table></spoiler>
+Естественно, прозводительность рефлексивного компарера ниже самописного. Рефлексия медленна и её API работает с <code>object</code>'ами, что незамедлительно сказывается на производительности, если в сравниваемых объектах присутствуют типы-значения, из-за необходимости выполнять boxing/unboxing. И тут уже необходимо исходить из собственных потребностей. Если рефлексия используется не часто, то с ней можно жить. Но в конкретном моём случае, рефлексивный компарер был недостаточно быстр. "Давай по новой<s>, Миш</s>", - сказал я себе и принялся за второй вариант.
+
+<h5>Часть 2. Игра в emitацию</h5>
+<img src="https://habrastorage.org/files/aa4/555/949/aa4555949ff84cf0b112c33d9c47156d.jpg"/>
+
+<blockquote>
+    Можно жить так, но лучше ускориться <br/>
+    <i>Группа Ленинград, "Мне бы в небо"</i><br/><br/>
+    
+    Нео: И ты это читаешь?<br/>
+    Сайфер: Приходится. Со временем привыкаешь. Я даже не замечаю код. Я вижу блондинку, брюнетку, рыженькую.
+    <i>Фильм "Матрица" (The Matrix)</i>    
+</blockquote>
+Рефлексия позволяет нам извлечь всю необходимую информацию о типах сравниваемых объектов. Но эти типы мы не можем использовать напрямую для получения нужных нам свойств или вызова требуемого метода, что приводит нас к использованию медленного API рефлексии (PropertyInfo.GetValue, MethodInfo.Invoke и т.д.). А что, если бы мы могли, используя информацию о типах, единожды сгенерировать код сравнения объектов и вызывать его каждый раз, не прибегая более к рефлексии? И, к счастью, мы можем это сделать! Пространство имён <a href="https://msdn.microsoft.com/en-us/library/system.reflection.emit(v=vs.110).aspx">System.Reflection.Emit</a>  предоставляет нам средства для создания динамических методов - <a href="https://msdn.microsoft.com/en-us/library/system.reflection.emit.dynamicmethod(v=vs.110).aspx">DynamicMethod</a> с помощью генератора <a href="https://ru.wikipedia.org/wiki/Common_Intermediate_Language">IL</a> - <a href="https://msdn.microsoft.com/en-us/library/system.reflection.emit.ilgenerator(v=vs.110).aspx">ILGenerator</a>. Именно такой же подход используется, к примеру, для компиляции регулярных выражений в самом .NET Framework (реализацию можно посмотреть <a href="http://referencesource.microsoft.com/#System/regex/system/text/regularexpressions/RegexCompiler.cs">тут</a>).
+
+О генерации IL на Хабре уже <a href="http://habrahabr.ru/post/172487/">писали</a>. Поэтому лишь вкратце напомним об особенностях IL.
+
+<a href="https://ru.wikipedia.org/wiki/Common_Intermediate_Language">Intermediate Language (IL)</a> представляет собой объектно-ориентированный язык ассемблера, используемый платформой .NET и Mono. Высокоуровневые языки, например, C#, VB.NET, F#, компилируются в IL, а IL в свою очередь компилируется JIT'ом в машинный код. Из-за своего промежуточного положения в этой цепочке язык и имеет своё название. IL использует стековую модель вычислений, то есть все входные и выходные данные передаются через стек, а не через регистры, как во многих процессорных архитектурах. IL поддерживает инструкции загрузки и сохранения локальных переменных и аргументов, преобразование типов, создание и манипулирование объектами, передачу управления, вызов методов, исключения и многие другие.
+
+К примеру, инкрементация целочисленной переменной будет на IL записана следующим образом:
+
+<source lang="IL">
+ldloc.0    // Загружаем переменную
+ldc.i4.1   // Загружаем единицу
+add        // Складываем
+stloc.0    // Сохраняем результат обратно в переменную
+</source>
+Посмотреть результат комплияции C# в IL можно посмотреть различными средствами, например, ILDasm (утилита, поставляемая вместе с Visual Studio) или <a href="http://ilspy.net/">ILSpy</a>. Но мой любимый способ - это с помощью замечательного веб-приложения <a href="http://tryroslyn.azurewebsites.net/">Try Roslyn</a>, написанного Андреем Щёкиным @ashmind.
+
+Вернёмся к нашей задаче. Мы опять будем делать делать реализацию интерфейса <code>IEqualityComparer&lt;object&gt;</code>:
+
+<source lang="CSharp">
+public class DynamicCodeComparer : IEqualityComparer<object>
+{
+    // Делегат для сравнения объектов
+    private delegate bool Comparer(object x, object y);
+
+    // Кэш сгенерированных компареров
+    private static Dictionary<Type, Comparer> ComparerCache = new Dictionary<Type, Comparer>();
+
+    public new bool Equals(object x, object y)
+    {
+        // Если ссылки указывают на один и тот же объект
+        if (ReferenceEquals(x, y)) return true;
+
+        // Один из объектов равен null
+        if (ReferenceEquals(x, null) != ReferenceEquals(y, null)) return false;
+
+        Type xType = x.GetType();
+
+        // Объекты имеют разные типы
+        if (xType != y.GetType()) return false;
+
+        //
+        // Проверяем наличие компарера в кэше. Если нет, то создаём его и сохраняем в кэш
+        //
+
+        Comparer comparer;
+        if (!ComparerCache.TryGetValue(xType, out comparer))
+        {
+            ComparerCache[xType] = comparer = new ComparerDelegateGenerator().Generate(xType);
+        }
+
+        return comparer(x, y);
+    }
+
+    public int GetHashCode(object obj)
+    {
+        return obj.GetHashCode();
+    }
+}
+</source> 
+Метод <code>Equals</code> использует словарь для поддержки кэша сгенерированных делегатов - компареров, выполняющих сравнение объектов. Если компарера для определённого типа ещё нет в словаре, то мы генерируем новый делегат. Вся логика по динамической генерации делегата будет сосредоточена в классе <code>ComparerDelegateGenerator</code>. 
+
+<source lang="CSharp">
+class ComparerDelegateGenerator
+{
+    // Генератор кода динамического метода
+    private ILGenerator il;
+
+    public Comparer Generate(Type type)
+    {
+        // Создаём динамический метод в том же модуле, что и сравниваемый тип
+        var dynamicMethod = new DynamicMethod("__DynamicCompare", typeof(bool), new[] { typeof(object), typeof(object) }, 
+                                              type.Module);
+
+        il = dynamicMethod.GetILGenerator();
+
+        //
+        // Загружаем аргументы и прикастовываем их к типу времени выполнения
+        //
+
+        il.LoadFirstArg();
+        var arg0 = il.CastToType(type);
+
+        il.LoadSecondArg();
+        var arg1 = il.CastToType(type);
+
+        // Сравниваем объекты
+        CompareObjectsInternal(type, arg0, arg1);
+
+        // Если управление дошло до этого места, значит объекты равны
+        il.ReturnTrue();
+
+        // Создаём делегат для выполнения динамического метода
+        return (Comparer)dynamicMethod.CreateDelegate(typeof(Comparer));
+    }
+}
+</source>
+В методе <code>Generate</code> выше есть один маленький нюанс. Нюанс состоит в том, чтобы создавать динамический метод в том же модуле, что и тип сравниваемых объектов. В противном случае код динамического метода не сможет получить доступ к типу и получит исключение <code>TypeAccessException</code>. Класс <code>ILGenerator</code> позволяет генерировать инструкции с помощью метода <a href="https://msdn.microsoft.com/en-us/library/system.reflection.emit.ilgenerator.emit(v=vs.110).aspx">Emit(OpCode)</a>, принимающего в качестве аргумента код команды. Но, чтобы не засорять наш класс такими деталями мы будем использовать методы расширения, из названия которых будет понятно, что они делают. Код методов расширения <code>LoadFirstArg, LoadSecondArg, CastToType</code> и <code>ReturnTrue</code> представлен ниже. Следует пояснить, что вызываемый в <code>Generate</code> метод <code>CompareObjectsInternal</code> будет генерировать <code>return false</code> сразу же, как только встретит отличающиеся значения. Поэтому последним операторам динамического метода будет <code>return true</code>, чтобы обрабатать ту ситуацию, когда объекты равны. 
+
+<spoiler title="Код методов расширения">
+<source lang="CSharp">
+// Загружает в стек первый аргумент текущего метода
+public static void LoadFirstArg(this ILGenerator il) => il.Emit(OpCodes.Ldarg_0);
+
+// Загружает в стек второй аргумент текущего метода
+public static void LoadSecondArg(this ILGenerator il) => il.Emit(OpCodes.Ldarg_1);
+
+// Извлекает из стека значение и приводит его к заданному типу
+public static LocalBuilder CastToType(this ILGenerator il, Type type)
+{    
+    var x = il.DeclareLocal(type);
+
+    // В случае типов-значений и примитивных типов выполняем распаковку
+    if (type.IsValueType || type.IsPrimitive)
+    {
+        il.Emit(OpCodes.Unbox_Any, type);
+    }
+    // В случае ссылочных типов выполняем приведение
+    else
+    {
+        il.Emit(OpCodes.Castclass, type);
+    }
+
+    il.SetLocal(x);
+    
+    return x;
+}
+
+// Загружает в стек ноль (он же false)
+public static void LoadZero(this ILGenerator il) => il.Emit(OpCodes.Ldc_I4_0);
+
+// Загружает в стек единицу (она же true)
+public static void LoadOne(this ILGenerator il) => il.Emit(OpCodes.Ldc_I4_1);
+
+// Возвращает из метода значение false
+public static void ReturnFalse(this ILGenerator il)
+{
+    il.LoadZero();
+    il.Emit(OpCodes.Ret);
+}
+
+// Возвращает из метода значение true
+public static void ReturnTrue(this ILGenerator il)
+{
+    il.LoadOne();
+    il.Emit(OpCodes.Ret);
+}
+</source></spoiler>
+Далее рассмотрим метод <code>CompareObjectsInternal</code>, который будет генерировать различный код сравнения в зависимости от типа объектов:
+
+<source lang="CSharp">
+private void CompareObjectsInternal(Type type, LocalBuilder x, LocalBuilder y)
+{
+    // Объявляем метку, на которую будем прыгать в случае, если объекты равны
+    var whenEqual = il.DefineLabel();
+
+    // Если объекты не являются типами-значений
+    if (!type.IsValueType)
+    {
+        // Тут же возвращаем true, если ссылки равны между собой
+        JumpIfReferenceEquals(x, y, whenEqual);
+
+        // Если один из объектов равен null, а второй нет возвращаем false
+        ReturnFalseIfOneIsNull(x, y);
+
+        // Массивы
+        if (type.IsArray)
+        {
+            CompareArrays(type.GetElementType(), x, y);
+        }
+        // Классы или интерфейсы
+        else if (type.IsClass || type.IsInterface)
+        {
+            // Строки
+            if (Type.GetTypeCode(type) == TypeCode.String)
+            {
+                CompareStrings(x, y, whenEqual);
+            }
+            // Коллекции
+            else if (type.IsImplementIEnumerable())
+            {
+                CompareEnumerables(type, x, y);
+            }
+            // Любые другие классы или интерфейсы
+            else
+            {
+                CompareAllProperties(type, x, y);
+            }
+        }
+    }
+    // Обнуляемые типы
+    else if (type.IsNullable())
+    {
+        CompareNullableValues(type, x, y, whenEqual);
+    }
+    // Примитивные типы или перечисления
+    else if (type.IsPrimitive || type.IsEnum)
+    {
+        ComparePrimitives(type, x, y, whenEqual);
+    }
+    // Структуры
+    else
+    {
+        CompareAllProperties(type, x, y);
+    }
+
+    // Ставим метку, на которую будем прыгать в случае, если объекты равны
+    il.MarkLabel(whenEqual);
+}
+</source>
+Как видно из кода, мы обрабатываем те же ситуации, что и в рефлексивном компарере, но в немного другом порядке. Это связано с тем, что сравнение с <code>null</code> генерируется только для ссылочных типов, но не для обнуляемых. В случае обнуляемых объектов вместо этого генерируется проверка свойства <code>HasValue</code>.
+
+Подробно разбирать каждый случай в статье не будем, в конце я дам ссылку на исходники. Но представим код сравнения массивов, чтобы прочувствовать, что из себя представляет разработка в условиях примитивных команд.
+
+<source lang="CSharp">
+private void CompareArrays(Type elementType, LocalBuilder x, LocalBuilder y)
+{
+    var loop = il.DefineLabel();  // Объявляем метку начала цикла сравнения элементов
+
+    il.LoadArrayLength(x);        // Загружаем длину первого массива
+    il.LoadArrayLength(y);        // Загружаем длину второго массива
+    il.JumpWhenEqual(loop);       // Если длины равны, то переходим к циклу
+    il.ReturnFalse();             // Иначе возвращаем false
+
+    il.MarkLabel(loop);           // Отмечаем метку начала цикла
+
+    var index = il.DeclareLocal(typeof(int)); // Объявляем счётчик цикла - индекс
+    var loopCondition = il.DefineLabel();     // Объявляем метку на проверку условия выхода из цикла
+    var loopBody = il.DefineLabel();          // Объявляем метку на тело цикла
+
+    il.LoadZero();            // 
+    il.SetLocal(index);       // Обнуляем индекс
+    il.Jump(loopCondition);   // Прыгаем на проверку условия цикла
+
+    il.MarkLabel(loopBody);   // Отмечаем начало тела цикла
+    {
+        var xElement = il.GetArrayElement(elementType, x, index); // Получаем элемент первого массива
+        var yElement = il.GetArrayElement(elementType, y, index); // Получаем элемент второго массива
+        CompareObjectsInternal(elementType, xElement, yElement);  // Сравниваем элементы
+        il.Increment(index);                                      // Увеличиваем счётчик
+    }
+
+    il.MarkLabel(loopCondition);     // Отмечаем метку проверки условия выхода из цикла
+    {
+        il.LoadLocal(index);         // Загружаем текущее значение  индекса
+        il.LoadArrayLength(x);       // Загружаем длину массива
+        il.JumpWhenLess(loopBody);   // Если индекс не вышел за пределы диапазона, то прыгаем в тело цикла
+    }
+}
+</source>
+Как мы уже отмечали выше, чтобы не <s>травмировать психику</s> засорять исходный текст кодами команд, мы будем использовать метода расширения. Поэтому представленный выше код выглядит не так уж и страшно. Как можно заметить в самом начале <code>CompareArrays</code> сравнивает длины массив и переходит к дальнейшему сравнению только в том случае, если они равны. Далее выполняется цикл поэлементного сравнения массивов, но так как в IL нет таких высокоуровневых операторов, как циклы, то мы определяем в нашем коде несколько базовых блоков: инициализацию счётчика, тело и проверку условия выхода из цикла. Переход же между этими блоками осуществляется с помощью инструкций условного перехода (<code>Jump, JumpWhenLess</code>) на метки <code>loopBody, loopCondition</code>.
+
+<spoiler title="Код методов расширения">
+<source lang="CSharp">
+// Загружает в стек значение заданной переменной
+public static void LoadLocal(this ILGenerator il, LocalBuilder x) => il.Emit(OpCodes.Ldloc, x);
+
+// Извлекает из стека значение и присваивает его заданной переменной
+public static void SetLocal(this ILGenerator il, LocalBuilder x) => il.Emit(OpCodes.Stloc, x);
+
+// Загружает в стек длину заданного массива
+public static void LoadArrayLength(this ILGenerator il, LocalBuilder array)
+{
+    il.LoadLocal(array);
+    il.Emit(OpCodes.Ldlen);
+    il.Emit(OpCodes.Conv_I4);
+}
+
+// Извлекает из стека массив и индекса, а загружает в стек элемент массива с заданным индексом
+public static void LoadArrayElement(this ILGenerator il, Type type)
+{
+    if (type.IsEnum)
+    {
+        type = Enum.GetUnderlyingType(type);
+    }
+
+    if (type.IsPrimitive)
+    {
+        if (type == typeof (IntPtr) || type == typeof (UIntPtr))
+        {
+            il.Emit(OpCodes.Ldelem_I);
+        }
+        else
+        {
+            OpCode opCode;
+
+            switch (Type.GetTypeCode(type))
+            {
+                case TypeCode.Boolean:
+                case TypeCode.Int32:
+                    opCode = OpCodes.Ldelem_I4;
+                    break;
+                case TypeCode.Char:
+                case TypeCode.UInt16:
+                    opCode = OpCodes.Ldelem_U2;
+                    break;
+                case TypeCode.SByte:
+                    opCode = OpCodes.Ldelem_I1;
+                    break;
+                case TypeCode.Byte:
+                    opCode = OpCodes.Ldelem_U1;
+                    break;
+                case TypeCode.Int16:
+                    opCode = OpCodes.Ldelem_I2;
+                    break;
+                case TypeCode.UInt32:
+                    opCode = OpCodes.Ldelem_U4;
+                    break;
+                case TypeCode.Int64:
+                case TypeCode.UInt64:
+                    opCode = OpCodes.Ldelem_I8;
+                    break;
+                case TypeCode.Single:
+                    opCode = OpCodes.Ldelem_R4;
+                    break;
+                case TypeCode.Double:
+                    opCode = OpCodes.Ldelem_R8;
+                    break;
+                default:
+                    throw new ArgumentOutOfRangeException();
+            }
+
+            il.Emit(opCode);
+        }
+    }
+    else if (type.IsValueType)
+    {
+        il.Emit(OpCodes.Ldelema, type);
+    }
+    else
+    {
+        il.Emit(OpCodes.Ldelem_Ref);
+    }
+}
+
+// Возвращает новую переменную, содержащую элемент массива с заданным индексом
+public static LocalBuilder GetArrayElement(this ILGenerator il, Type elementType, LocalBuilder array, LocalBuilder index)
+{
+    var x = il.DeclareLocal(elementType);
+    il.LoadLocal(array);
+    il.LoadLocal(index);
+    il.LoadArrayElement(elementType);
+    il.SetLocal(x);
+    return x;
+}
+
+// Увеличивает значение заданной переменной на единицу
+public static void Increment(this ILGenerator il, LocalBuilder x)
+{
+    il.LoadLocal(x);
+    il.LoadOne();
+    il.Emit(OpCodes.Add);
+    il.SetLocal(x);
+}
+</source></spoiler>
+Попробуем применить <code>DynamicCodeComparer</code> к типу <code>SimpleClass</code>, который мы использовали для сравнения прозводительности рефлексивного компарера:
+
+<spoiler title="Сгенерированный метод - IL">
+<source lang="IL">
+.method public static 
+	bool __DynamicCompare (
+		object '',
+		object ''
+	) cil managed 
+{
+	// Method begins at RVA 0x2050
+	// Code size 215 (0xd7)
+	.maxstack 15
+	.locals init (
+		[0] class SimpleClass,
+		[1] class SimpleClass,
+		[2] int32,
+		[3] int32,
+		[4] valuetype Struct,
+		[5] valuetype Struct,
+		[6] int32,
+		[7] int32,
+		[8] float64,
+		[9] float64,
+		[10] string,
+		[11] string
+	)
+
+	IL_0000: ldarg.0
+	IL_0001: castclass SimpleClass
+	IL_0006: stloc.0
+	IL_0007: ldarg.1
+	IL_0008: castclass SimpleClass
+	IL_000d: stloc.1
+	IL_000e: ldloc.0
+	IL_000f: ldloc.1
+	IL_0010: beq IL_00d5
+
+	IL_0015: ldloc.0
+	IL_0016: ldnull
+	IL_0017: ceq
+	IL_0019: ldloc.1
+	IL_001a: ldnull
+	IL_001b: ceq
+	IL_001d: beq IL_0024
+
+	IL_0022: ldc.i4.0
+	IL_0023: ret
+
+	IL_0024: ldloc.0
+	IL_0025: callvirt instance int32 SimpleClass::get_A()
+	IL_002a: stloc.2
+	IL_002b: ldloc.1
+	IL_002c: callvirt instance int32 SimpleClass::get_A()
+	IL_0031: stloc.3
+	IL_0032: ldloc.2
+	IL_0033: ldloc.3
+	IL_0034: beq IL_003b
+
+	IL_0039: ldc.i4.0
+	IL_003a: ret
+
+	IL_003b: ldloc.0
+	IL_003c: callvirt instance valuetype Struct SimpleClass::get_B()
+	IL_0041: stloc.s 4
+	IL_0043: ldloc.1
+	IL_0044: callvirt instance valuetype Struct SimpleClass::get_B()
+	IL_0049: stloc.s 5
+	IL_004b: ldloca.s 4
+	IL_004d: call instance int32 Struct::get_A()
+	IL_0052: stloc.s 6
+	IL_0054: ldloca.s 5
+	IL_0056: call instance int32 Struct::get_A()
+	IL_005b: stloc.s 7
+	IL_005d: ldloc.s 6
+	IL_005f: ldloc.s 7
+	IL_0061: beq IL_0068
+
+	IL_0066: ldc.i4.0
+	IL_0067: ret
+
+	IL_0068: ldloca.s 4
+	IL_006a: call instance float64 Struct::get_B()
+	IL_006f: stloc.s 8
+	IL_0071: ldloca.s 5
+	IL_0073: call instance float64 Struct::get_B()
+	IL_0078: stloc.s 9
+	IL_007a: ldloc.s 8
+	IL_007c: call bool [mscorlib]System.Double::IsNaN(float64)
+	IL_0081: ldloc.s 9
+	IL_0083: call bool [mscorlib]System.Double::IsNaN(float64)
+	IL_0088: and
+	IL_0089: brtrue IL_0099
+
+	IL_008e: ldloc.s 8
+	IL_0090: ldloc.s 9
+	IL_0092: beq IL_0099
+
+	IL_0097: ldc.i4.0
+	IL_0098: ret
+
+	IL_0099: ldloca.s 4
+	IL_009b: call instance string Struct::get_C()
+	IL_00a0: stloc.s 10
+	IL_00a2: ldloca.s 5
+	IL_00a4: call instance string Struct::get_C()
+	IL_00a9: stloc.s 11
+	IL_00ab: ldloc.s 10
+	IL_00ad: ldloc.s 11
+	IL_00af: beq IL_00d5
+
+	IL_00b4: ldloc.s 10
+	IL_00b6: ldnull
+	IL_00b7: ceq
+	IL_00b9: ldloc.s 11
+	IL_00bb: ldnull
+	IL_00bc: ceq
+	IL_00be: beq IL_00c5
+
+	IL_00c3: ldc.i4.0
+	IL_00c4: ret
+
+	IL_00c5: ldloc.s 10
+	IL_00c7: ldloc.s 11
+	IL_00c9: call instance bool [mscorlib]System.String::Equals(string)
+	IL_00ce: brtrue IL_00d5
+
+	IL_00d3: ldc.i4.0
+	IL_00d4: ret
+
+	IL_00d5: ldc.i4.1
+	IL_00d6: ret
+} // end of method Test::__DynamicCompare
+</source></spoiler>
+<spoiler title="Сгенерированный метод - C# (декомпилирован с помощью ILSpy)">
+<source lang="CSharp">
+public static bool __DynamicCompare(object obj, object obj2)
+{
+	SimpleClass simpleClass = (SimpleClass)obj;
+	SimpleClass simpleClass2 = (SimpleClass)obj2;
+	if (simpleClass != simpleClass2)
+	{
+		if (simpleClass == null != (simpleClass2 == null))
+		{
+			return false;
+		}
+		int a = simpleClass.A;
+		int a2 = simpleClass2.A;
+		if (a != a2)
+		{
+			return false;
+		}
+		Struct b = simpleClass.B;
+		Struct b2 = simpleClass2.B;
+		int a3 = b.get_A();
+		int a4 = b2.get_A();
+		if (a3 != a4)
+		{
+			return false;
+		}
+		double b3 = b.get_B();
+		double b4 = b2.get_B();
+		if (!(double.IsNaN(b3) & double.IsNaN(b4)) && b3 != b4)
+		{
+			return false;
+		}
+		string c = b.get_C();
+		string c2 = b2.get_C();
+		if (c != c2)
+		{
+			if (c == null != (c2 == null))
+			{
+				return false;
+			}
+			if (!c.Equals(c2))
+			{
+				return false;
+			}
+		}
+	}
+	return true;
+}
+</source></spoiler>
+Декомпилированный метод выглядит достаточно понятно, чтобы проверить, что он корректно выполняет сравнение. Единственное к чему можно было бы придраться, так это обилие временных переменных, но это, как говорится, издержки производства.
+
+<h5>Результаты</h5>
+Ниже представлены результаты сравнения производительности <code>DynamicCodeComparer, ReflectionComparer</code> и написанного вручную сравнения на тех же входных данных, на которых мы проводили наш микробенчмарк для рефлексивного компарера. Как видно генерация IL позволяет получить гораздо более эффективную реализацию по сравнению с рефлексией.
+
+<spoiler title="Код микробенчмарка">
+<source lang="CSharp">
+public struct Struct
+{
+    private int m_a;
+    private double m_b;
+    private string m_c;
+
+    public int A => m_a;
+    public double B => m_b;
+    public string C => m_c;
+
+    public Struct(int a, double b, string c)
+    {
+        m_a = a;
+        m_b = b;
+        m_c = c;
+    }
+}
+
+public class SimpleClass
+{
+    public int A { get; set; }
+    public Struct B { get; set; }
+}
+
+public class ComplexClass
+{
+    public int A { get; set; }
+    public IntPtr B { get; set; }
+    public UIntPtr C { get; set; }
+    public string D { get; set; }
+    public SimpleClass E { get; set; }
+    public int? F { get; set; }
+    public int[] G { get; set; }
+    public List<int> H { get; set; }
+    public double I { get; set; }
+    public float J { get; set; }
+}
+
+[BenchmarkTask(platform: BenchmarkPlatform.X86, jitVersion: BenchmarkJitVersion.LegacyJit)]
+[BenchmarkTask(platform: BenchmarkPlatform.X64, jitVersion: BenchmarkJitVersion.LegacyJit)]
+[BenchmarkTask(platform: BenchmarkPlatform.X64, jitVersion: BenchmarkJitVersion.RyuJit)]
+public class ComplexComparisonTest
+{
+    private static int[] MakeArray(int count)
+    {
+        var array = new int[count];
+
+        for (int i = 0; i < array.Length; ++i)
+            array[i] = i;
+
+        return array;
+    }
+
+    private static List<int> MakeList(int count)
+    {
+        var list = new List<int>(count);
+
+        for (int i = 0; i < list.Count; ++i)
+            list.Add(i);
+
+        return list;
+    }
+
+    private ComplexClass x = new ComplexClass
+    {
+        A = 2,
+        B = new IntPtr(2),
+        C = new UIntPtr(2),
+        D = "Habrahabr!",
+        E = new SimpleClass { A = 42, B = new Struct(42, 3.14, "meow") },
+        F = 1,
+        G = MakeArray(100),
+        H = MakeList(100),
+        I = double.MaxValue,
+        J = float.MaxValue
+    };
+
+    private ComplexClass y = new ComplexClass
+    {
+        A = 2,
+        B = new IntPtr(2),
+        C = new UIntPtr(2),
+        D = "Habrahabr!",
+        E = new SimpleClass { A = 42, B = new Struct(42, 3.14, "meow") },
+        F = 1,
+        G = MakeArray(100),
+        H = MakeList(100),
+        I = double.MaxValue,
+        J = float.MaxValue
+    };
+
+    private ReflectionComparer reflectionComparer = new ReflectionComparer();
+    private DynamicCodeComparer dynamicCodeComparer = new DynamicCodeComparer();
+
+    [Benchmark]
+    public void ReflectionCompare()
+    {
+        var _ = reflectionComparer.Equals(x, y);
+    }
+
+    [Benchmark]
+    public void DynamicCodeCompare()
+    {
+        var _ = dynamicCodeComparer.Equals(x, y);
+    }
+
+    [Benchmark]
+    public void ManualCompare()
+    {
+        var _ = CompareComplexObjects();
+    }
+
+    private bool CompareComplexObjects()
+    {
+        if (x == y) return true;
+        if (x.A != y.A) return false;
+        if (x.B != y.B) return false;
+        if (x.C != y.C) return false;
+        if (x.D != y.D) return false;
+        if (x.E != y.E)
+        {
+            if (x.E.A != y.E.A) return false;
+            var s1 = x.E.B;
+            var s2 = y.E.B;
+            if (s1.A != s2.A) return false;
+            if (!s1.B.Equals(s2.B)) return false;
+            if (s1.C != s2.C) return false;
+        }
+        if (x.F != y.F) return false;
+        if (x.G != y.G)
+        {
+            if (x.G?.Length != y.G?.Length) return false;
+            int[] a = x.G, b = y.G;
+            for (int i = 0; i < a.Length; ++i)
+            {
+                if (a[i] != b[i]) return false;
+            }
+        }
+        if (x.H != y.H)
+        {
+            if (!x.H.SequenceEqual(y.H)) return false;
+        }
+        if (!x.I.Equals(y.I)) return false;
+        if (!x.J.Equals(y.J)) return false;
+        return true;
+    }
+}
+
+[BenchmarkTask(platform: BenchmarkPlatform.X86, jitVersion: BenchmarkJitVersion.LegacyJit)]
+[BenchmarkTask(platform: BenchmarkPlatform.X64, jitVersion: BenchmarkJitVersion.LegacyJit)]
+[BenchmarkTask(platform: BenchmarkPlatform.X64, jitVersion: BenchmarkJitVersion.RyuJit)]
+public class SimpleComparisonTest
+{
+    private SimpleClass x = new SimpleClass { A = 42, B = new Struct(42, 3.14, "meow") };
+    private SimpleClass y = new SimpleClass { A = 42, B = new Struct(42, 3.14, "meow") };
+
+    private ReflectionComparer reflectionComparer = new ReflectionComparer();
+    private DynamicCodeComparer dynamicCodeComparer = new DynamicCodeComparer();
+
+    [Benchmark]
+    public void ReflectionCompare()
+    {
+        var _ = reflectionComparer.Equals(x, y);
+    }
+
+    [Benchmark]
+    public void DynamicCodeCompare()
+    {
+        var _ = dynamicCodeComparer.Equals(x, y);
+    }
+
+    [Benchmark]
+    public void ManualCompare()
+    {
+        var _ = CompareSimpleObjects();
+    }
+
+    private bool CompareSimpleObjects()
+    {
+        if (x == y) return true;
+        if (x.A != y.A) return false;
+        var s1 = x.B;
+        var s2 = y.B;
+        if (s1.A != s2.A) return false;
+        if (!s1.B.Equals(s2.B)) return false;
+        if (s1.C != s2.C) return false;
+        return true;
+    }
+}
+</source></spoiler>
+<b>Результаты сравнения объектов ComplexClass</b>
+<table>
+<tr>
+  <th>Method</th>
+  <th>Platform</th>
+  <th>Jit</th>
+  <th>AvrTime</th>
+  <th>StdDev</th>
+  <th>op/s</th>
+</tr>
+<tr>
+  <td>DynamicCodeComparer</td>
+  <td>X64</td>
+  <td>LegacyJit</td>
+  <td>1,104.7155 ns</td>
+  <td>32.9474 ns</td>
+  <td>905,210.51</td>
+</tr>
+<tr>
+  <td>Handwritten</td>
+  <td>X64</td>
+  <td>LegacyJit</td>
+  <td>1,360.3273 ns</td>
+  <td>39.9703 ns</td>
+  <td>735,117.32</td>
+</tr>
+<tr>
+  <td>ReflectionComparer</td>
+  <td>X64</td>
+  <td>LegacyJit</td>
+  <td>38,043.3600 ns</td>
+  <td>2,261.3159 ns</td>
+  <td>26,290.11</td>
+</tr>
+<tr>
+  <td>DynamicCodeComparer</td>
+  <td>X64</td>
+  <td>RyuJit</td>
+  <td>834.8742 ns</td>
+  <td>58.1986 ns</td>
+  <td>1,197,785.93</td>
+</tr>
+<tr>
+  <td>Handwritten</td>
+  <td>X64</td>
+  <td>RyuJit</td>
+  <td>968.3789 ns</td>
+  <td>33.1622 ns</td>
+  <td>1,032,653.82</td>
+</tr>
+<tr>
+  <td>ReflectionComparer</td>
+  <td>X64</td>
+  <td>RyuJit</td>
+  <td>37,751.3104 ns</td>
+  <td>1,763.3172 ns</td>
+  <td>26,489.20</td>
+</tr>
+<tr>
+  <td>DynamicCodeComparer</td>
+  <td>X86</td>
+  <td>LegacyJit</td>
+  <td>776.0265 ns</td>
+  <td>22.8038 ns</td>
+  <td>1,288,615.79</td>
+</tr>
+<tr>
+  <td>Handwritten</td>
+  <td>X86</td>
+  <td>LegacyJit</td>
+  <td>915.5713 ns</td>
+  <td>26.0536 ns</td>
+  <td>1,092,214.32</td>
+</tr>
+<tr>
+  <td>ReflectionComparer</td>
+  <td>X86</td>
+  <td>LegacyJit</td>
+  <td>32,382.2746 ns</td>
+  <td>1,748.4016 ns</td>
+  <td>30,881.10</td>
+</tr>
+</table> 
+<b>Результаты сравнения объектов SimpleClass</b>
+<table>
+<tr>
+  <th>Method</th>
+  <th>Platform</th>
+  <th>Jit</th>
+  <th>AvrTime</th>
+  <th>StdDev</th>
+  <th>op/s</th>
+</tr>
+<tr>
+  <td>DynamicCodeComparer</td>
+  <td>X64</td>
+  <td>LegacyJit</td>
+  <td>215.7626 ns</td>
+  <td>8.2063 ns</td>
+  <td>4,634,725.08</td>
+</tr>
+<tr>
+  <td>Handwritten</td>
+  <td>X64</td>
+  <td>LegacyJit</td>
+  <td>160.4945 ns</td>
+  <td>6.8949 ns</td>
+  <td>6,230,741.94</td>
+</tr>
+<tr>
+  <td>ReflectionComparer</td>
+  <td>X64</td>
+  <td>LegacyJit</td>
+  <td>6,654.3290 ns</td>
+  <td>380.7790 ns</td>
+  <td>150,278.15</td>
+</tr>
+<tr>
+  <td>DynamicCodeComparer</td>
+  <td>X64</td>
+  <td>RyuJit</td>
+  <td>168.4194 ns</td>
+  <td>9.4654 ns</td>
+  <td>5,937,569.56</td>
+</tr>
+<tr>
+  <td>Handwritten</td>
+  <td>X64</td>
+  <td>RyuJit</td>
+  <td>87.8513 ns</td>
+  <td>3.3118 ns</td>
+  <td>11,382,874.20</td>
+</tr>
+<tr>
+  <td>ReflectionComparer</td>
+  <td>X64</td>
+  <td>RyuJit</td>
+  <td>6,954.6437 ns</td>
+  <td>387.1803 ns</td>
+  <td>143,789.85</td>
+</tr>
+<tr>
+  <td>DynamicCodeComparer</td>
+  <td>X86</td>
+  <td>LegacyJit</td>
+  <td>180.4105 ns</td>
+  <td>6.5036 ns</td>
+  <td>5,542,914.59</td>
+</tr>
+<tr>
+  <td>Handwritten</td>
+  <td>X86</td>
+  <td>LegacyJit</td>
+  <td>93.0846 ns</td>
+  <td>4.0584 ns</td>
+  <td>10,742,923.17</td>
+</tr>
+<tr>
+  <td>ReflectionComparer</td>
+  <td>X86</td>
+  <td>LegacyJit</td>
+  <td>6,431.5783 ns</td>
+  <td>314.5633 ns</td>
+  <td>155,483.09</td>
+</tr>
+</table>
+<h5>Заключение</h5>
+Фред Брукс в своей знаменитой статье "No silver bullet" подчёркивает разницу между ненужными случайными сложностями (accidental complexity) и имманентными сложностями (essential complexity), внутренне присущими самой решаемой задаче.  Использование рефлексии зачастую является примером такой ненужной сложности, возникшей из-за того, что в какой-то момент дизайну программной системы не было уделено достаточно внимания. Поэтому прежде чем кидаться скорее использовать рефексию или кодогенерацию проверьте, может быть ещё не поздно подкорректировать проектное решение. Конкретно в моём случае сравнение могло было бы выполняться одной строчкой, если бы все сравниваемые объекты реализовывали бы интерфейс <code>IEquatable&lt;T&gt;</code>. Тем не менее я получил решение, которое возможно кому-нибудь ещё окажется полезным.
+ 
+Засим откланиваюсь, дорогие читатели. Приятного программирования!   
+
+Полезные ресурсы:
+<ul>
+    <li>
+        <a href="https://github.com/akarpov89/DynamicComparer">Исходный код к статье</a>
+    </li>
+    <li>
+        <a href="http://www.williamspublishing.com/Books/978-5-8459-1819-2.html">Джозеф Албахари, Бен Албахари. C# 5.0. Справочник. Полное описание языка</a>        
+    </li>
+    <li>
+        <a href="http://www.apress.com/9781590596463">Serge Lidin. Expert .NET 2.0 IL Assembler</a>
+    </li>
+    <li>
+        MSDN - <a href="https://msdn.microsoft.com/en-us/library/system.reflection.emit%28v%3Dvs.110%29.aspx">System.Reflection.Emit Namespace</a>
+    </li>
+    <li>
+        Библиотека <a href="https://github.com/PerfDotNet/BenchmarkDotNet">BenchmarkDotNet</a>
+    </li>
+    <li>
+        <a href="http://tryroslyn.azurewebsites.net/">Try Roslyn</a>
+    </li>
+</ul>
