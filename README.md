@@ -1,2 +1,2 @@
-# my-habr
-My habrahabr articles
+* [Сравни меня полностью. Рефлексия на службе .NET разработчика](https://habrahabr.ru/post/269699/)
+* [Неупакованные типы объединений в Scala на основе изоморфизма Карри-Ховарда](https://habrahabr.ru/post/269907/)
